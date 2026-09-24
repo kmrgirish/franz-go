@@ -5,73 +5,99 @@ import (
 	"testing"
 )
 
-// TestBuildAckRangesInterleavedGaps covers a read_uncommitted partition
-// holding normal, committed, and aborted records: offsets 2 and 4 are
-// transaction control records, so they are acquired but become internal
-// gap acks. The broker requires batches in offset order, so the gaps must
-// be interleaved with the user acks rather than appended after them.
-func TestBuildAckRangesInterleavedGaps(t *testing.T) {
-	src := new(source)
-	slab := &shareAckSlab{ackSource: src, sessionEpoch: 1}
-	gap := func(o int64) shareAckRange {
-		return shareAckRange{firstOffset: o, lastOffset: o, source: src, sessionEpoch: 1}
-	}
-	entry := func(o int64, s AckStatus) *shareAckState {
-		e := &shareAckState{offset: o, slab: slab}
-		e.status.Store(int32(s))
+// TestShareBuildAckRangesOffsetOrder is the regression test for gap acks
+// being appended after every user ack.
+//
+// A read_uncommitted share partition holding a normal record, a committed
+// transaction, and an aborted transaction has data at offsets 0, 1, and 3
+// and transaction markers at 2 and 4. The broker acquires 0-4, but only
+// 0, 1, and 3 are returned to the user; processSharePartition queues gap
+// acks for 2 and 4. If those gaps are drained alongside the user's acks,
+// buildAckRanges previously emitted [0-1 accept] [3 accept] [2 gap]
+// [4 gap]. Kafka rejects a partition whose ack batches are not in offset
+// order (KafkaApis.validateAcknowledgementBatches) with INVALID_REQUEST,
+// so the user's acks failed. Gaps must be interleaved with user acks by
+// offset.
+func TestShareBuildAckRangesOffsetOrder(t *testing.T) {
+	t.Parallel()
+
+	s := new(source)
+	slab := &shareAckSlab{ackSource: s, sessionEpoch: 1}
+	ack := func(offset int64, status AckStatus) *shareAckState {
+		e := &shareAckState{offset: offset, slab: slab}
+		e.status.Store(int32(status))
 		return e
 	}
+	rng := func(first, last int64, ackType int8) shareAckRange {
+		return shareAckRange{firstOffset: first, lastOffset: last, source: s, sessionEpoch: 1, ackType: ackType}
+	}
+	gap := func(first, last int64) shareAckRange { return rng(first, last, 0) }
 
-	for _, tc := range []struct {
+	var (
+		accept  = int8(AckAccept)
+		release = int8(AckRelease)
+	)
+
+	tests := []struct {
 		name    string
 		entries []*shareAckState
 		gaps    []shareAckRange
-		want    [][3]int64 // first, last, type
+		exp     []shareAckRange
 	}{
 		{
-			name:    "control records between user acks",
-			entries: []*shareAckState{entry(0, AckAccept), entry(1, AckAccept), entry(3, AckAccept)},
-			gaps:    []shareAckRange{gap(2), gap(4)},
-			want:    [][3]int64{{0, 1, 1}, {2, 2, 0}, {3, 3, 1}, {4, 4, 0}},
+			name:    "transaction markers between user acks",
+			entries: []*shareAckState{ack(0, AckAccept), ack(1, AckAccept), ack(3, AckAccept)},
+			gaps:    []shareAckRange{gap(2, 2), gap(4, 4)},
+			exp:     []shareAckRange{rng(0, 1, accept), gap(2, 2), rng(3, 3, accept), gap(4, 4)},
 		},
 		{
-			name:    "unsorted inputs",
-			entries: []*shareAckState{entry(3, AckAccept), entry(0, AckAccept), entry(1, AckAccept)},
-			gaps:    []shareAckRange{gap(4), gap(2)},
-			want:    [][3]int64{{0, 1, 1}, {2, 2, 0}, {3, 3, 1}, {4, 4, 0}},
+			name:    "unsorted entries and gaps",
+			entries: []*shareAckState{ack(3, AckAccept), ack(0, AckAccept), ack(1, AckAccept)},
+			gaps:    []shareAckRange{gap(4, 4), gap(2, 2)},
+			exp:     []shareAckRange{rng(0, 1, accept), gap(2, 2), rng(3, 3, accept), gap(4, 4)},
 		},
 		{
-			name:    "leading gap",
-			entries: []*shareAckState{entry(5, AckRelease)},
-			gaps:    []shareAckRange{{firstOffset: 0, lastOffset: 4, source: src, sessionEpoch: 1}},
-			want:    [][3]int64{{0, 4, 0}, {5, 5, 2}},
+			name:    "gap before every user ack",
+			entries: []*shareAckState{ack(5, AckRelease)},
+			gaps:    []shareAckRange{gap(0, 4)},
+			exp:     []shareAckRange{gap(0, 4), rng(5, 5, release)},
 		},
 		{
-			name: "gaps only",
-			gaps: []shareAckRange{gap(3), gap(2)},
-			want: [][3]int64{{2, 3, 0}},
+			name: "only gaps",
+			gaps: []shareAckRange{gap(3, 3), gap(2, 2)},
+			exp:  []shareAckRange{gap(2, 3)},
 		},
 		{
-			name:    "undecided entry skipped",
-			entries: []*shareAckState{entry(0, AckAccept), entry(1, 0), entry(3, AckAccept)},
-			gaps:    []shareAckRange{gap(2)},
-			want:    [][3]int64{{0, 0, 1}, {2, 2, 0}, {3, 3, 1}},
+			name:    "undecided entry is skipped",
+			entries: []*shareAckState{ack(0, AckAccept), ack(1, 0), ack(3, AckAccept)},
+			gaps:    []shareAckRange{gap(2, 2)},
+			exp:     []shareAckRange{rng(0, 0, accept), gap(2, 2), rng(3, 3, accept)},
 		},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			ranges, _ := buildAckRanges(tc.entries, slices.Clone(tc.gaps))
-			var got [][3]int64
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			ranges, _ := buildAckRanges(test.entries, slices.Clone(test.gaps))
+			if !slices.Equal(ranges, test.exp) {
+				t.Fatalf("expected %v, got %v", fmtAckRanges(test.exp), fmtAckRanges(ranges))
+			}
+			// Mirror the broker's validation: each batch must start
+			// after the previous batch ended.
 			prevEnd := int64(-1)
 			for _, r := range ranges {
 				if r.firstOffset <= prevEnd {
-					t.Errorf("range %d-%d starts before previous end %d", r.firstOffset, r.lastOffset, prevEnd)
+					t.Fatalf("range %d-%d starts at or before previous range end %d", r.firstOffset, r.lastOffset, prevEnd)
 				}
 				prevEnd = r.lastOffset
-				got = append(got, [3]int64{r.firstOffset, r.lastOffset, int64(r.ackType)})
-			}
-			if !slices.Equal(got, tc.want) {
-				t.Errorf("got %v, want %v", got, tc.want)
 			}
 		})
 	}
+}
+
+func fmtAckRanges(ranges []shareAckRange) [][3]int64 {
+	out := make([][3]int64, 0, len(ranges))
+	for _, r := range ranges {
+		out = append(out, [3]int64{r.firstOffset, r.lastOffset, int64(r.ackType)})
+	}
+	return out
 }
