@@ -2346,3 +2346,142 @@ func TestShareGroupLeaderMoveInFlightAcks(t *testing.T) {
 		t.Errorf("callback never fired for partition 0 after in-flight ack+move; acks may have stranded on the migrated cursor. Results: %+v", cbResults)
 	}
 }
+
+// TestShareGroupAckGapsOrderedWithUserAcks is a regression test for
+// buildAckRanges appending internal gap acks after every user ack.
+//
+// With read_uncommitted, a partition holding a plain record, a committed
+// transaction, and an aborted transaction has data at offsets 0, 1, and 3
+// and transaction markers at 2 and 4. All five offsets are acquired, but
+// the markers are not returned to the user, so the client queues gap acks
+// for 2 and 4. When those gaps are drained in the same request as the
+// user's acks, the batches previously went out as [0-1] [3] [2] [4]. The
+// broker rejects a partition whose batches are not in offset order, and
+// the user's acks failed with INVALID_REQUEST.
+//
+// Acking immediately after the poll (no scheduling point, as in
+// TestShareGroupAckDedupRenewThenTerminal) lands the user acks next to the
+// still-pending gaps, so the next ack-carrying request holds both.
+func TestShareGroupAckGapsOrderedWithUserAcks(t *testing.T) {
+	t.Parallel()
+
+	const topic = "share-ack-gap-order"
+	const group = "share-test-ack-gap-order"
+
+	c := newCluster(t, SeedTopics(1, topic))
+	c.SetGroupConfigs(group, map[string]string{
+		"share.auto.offset.reset": "earliest",
+		"share.isolation.level":   "read_uncommitted",
+	})
+
+	plain := newPlainClient(t, c)
+	produceSync(t, plain, &kgo.Record{Topic: topic, Value: []byte("plain")})
+
+	for _, commit := range []bool{true, false} {
+		txn := newPlainClient(t, c, kgo.TransactionalID("share-ack-gap-order-"+strconv.FormatBool(commit)))
+		if err := txn.BeginTransaction(); err != nil {
+			t.Fatalf("begin txn: %v", err)
+		}
+		produceSync(t, txn, &kgo.Record{Topic: topic, Value: []byte("txn-" + strconv.FormatBool(commit))})
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		if err := txn.EndTransaction(ctx, kgo.TransactionEndTry(commit)); err != nil {
+			cancel()
+			t.Fatalf("end txn (commit=%v): %v", commit, err)
+		}
+		cancel()
+	}
+
+	// Mirror the broker's ordering check on every ack-carrying request
+	// so a failure names the offending batches, not just the error code.
+	var (
+		mu        sync.Mutex
+		unordered []string
+	)
+	check := func(kreq kmsg.Request) (kmsg.Response, error, bool) {
+		c.KeepControl()
+		var parts [][][2]int64 // per partition: [first, last] per batch
+		switch req := kreq.(type) {
+		case *kmsg.ShareAcknowledgeRequest:
+			for _, rt := range req.Topics {
+				for _, rp := range rt.Partitions {
+					var batches [][2]int64
+					for _, b := range rp.AcknowledgementBatches {
+						batches = append(batches, [2]int64{b.FirstOffset, b.LastOffset})
+					}
+					parts = append(parts, batches)
+				}
+			}
+		case *kmsg.ShareFetchRequest:
+			for _, rt := range req.Topics {
+				for _, rp := range rt.Partitions {
+					var batches [][2]int64
+					for _, b := range rp.AcknowledgementBatches {
+						batches = append(batches, [2]int64{b.FirstOffset, b.LastOffset})
+					}
+					parts = append(parts, batches)
+				}
+			}
+		}
+		for _, batches := range parts {
+			prevEnd := int64(-1)
+			for _, b := range batches {
+				if b[0] <= prevEnd {
+					var s []string
+					for _, b := range batches {
+						s = append(s, strconv.FormatInt(b[0], 10)+"-"+strconv.FormatInt(b[1], 10))
+					}
+					mu.Lock()
+					unordered = append(unordered, strings.Join(s, " "))
+					mu.Unlock()
+					break
+				}
+				prevEnd = b[1]
+			}
+		}
+		return nil, nil, false
+	}
+	c.ControlKey(int16(kmsg.ShareAcknowledge), check)
+	c.ControlKey(int16(kmsg.ShareFetch), check)
+
+	var acks shareAckCollector
+	cl := newShareConsumer(t, c, topic, group, acks.opt())
+
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+
+	var values []string
+	for len(values) < 3 && ctx.Err() == nil {
+		fetches := cl.PollFetches(ctx)
+		// Ack before anything else so the acks join the pending gaps.
+		for _, r := range fetches.Records() {
+			r.Ack(kgo.AckAccept)
+		}
+		for _, r := range fetches.Records() {
+			values = append(values, string(r.Value))
+		}
+	}
+	if exp := []string{"plain", "txn-true", "txn-false"}; !slices.Equal(values, exp) {
+		t.Fatalf("expected records %v, got %v", exp, values)
+	}
+
+	flushCtx, flushCancel := context.WithTimeout(ctx, 5*time.Second)
+	if err := cl.FlushAcks(flushCtx); err != nil {
+		t.Fatalf("FlushAcks: %v", err)
+	}
+	flushCancel()
+
+	mu.Lock()
+	defer mu.Unlock()
+	if len(unordered) > 0 {
+		t.Errorf("expected ack batches in offset order, got %v", unordered)
+	}
+	results := acks.snapshot()
+	if len(results) == 0 {
+		t.Fatal("ShareAckCallback never fired")
+	}
+	for _, r := range results {
+		if r.Err != nil {
+			t.Errorf("expected nil ack error for %s/%d, got %v", r.Topic, r.Partition, r.Err)
+		}
+	}
+}
