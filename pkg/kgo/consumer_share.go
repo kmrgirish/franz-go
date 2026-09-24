@@ -2321,8 +2321,10 @@ func ackTypes(t int8) []int8 {
 //
 // Entries and gaps are sorted by offset before coalescing so that
 // contiguous same-type ranges merge regardless of insertion order.
-// The two are built separately (gaps are acked immediately so they
-// rarely coalesce with user entries).
+// User entries and gaps are then merged by offset: the broker rejects
+// a partition with INVALID_REQUEST if a batch starts before the prior
+// batch ended, and gaps (e.g. transaction control records) can sit
+// between user-acked offsets.
 func buildAckRanges(entries []*shareAckState, gaps []shareAckRange) (ranges []shareAckRange, hasRenew bool) {
 	slices.SortFunc(entries, func(a, b *shareAckState) int {
 		return cmp.Compare(a.offset, b.offset)
@@ -2336,7 +2338,10 @@ func buildAckRanges(entries []*shareAckState, gaps []shareAckRange) (ranges []sh
 	// Both entries read the same final status, so emit only one. Without
 	// this, the request carries two adjacent [X,X,T] batches and the
 	// broker rejects with INVALID_RECORD_STATE.
-	var lastOffset int64 = -1
+	var (
+		lastOffset int64 = -1
+		gi         int
+	)
 	for _, e := range entries {
 		t := int8(e.status.Load())
 		if t == 0 {
@@ -2349,6 +2354,9 @@ func buildAckRanges(entries []*shareAckState, gaps []shareAckRange) (ranges []sh
 		if t == int8(AckRenew) {
 			hasRenew = true
 		}
+		for ; gi < len(gaps) && gaps[gi].firstOffset < e.offset; gi++ {
+			ranges = coalesceAppendRange(ranges, gaps[gi])
+		}
 		ranges = coalesceAppendRange(ranges, shareAckRange{
 			firstOffset:  e.offset,
 			lastOffset:   e.offset,
@@ -2357,7 +2365,7 @@ func buildAckRanges(entries []*shareAckState, gaps []shareAckRange) (ranges []sh
 			ackType:      t,
 		})
 	}
-	for _, g := range gaps {
+	for _, g := range gaps[gi:] {
 		ranges = coalesceAppendRange(ranges, g)
 	}
 	return
